@@ -66,6 +66,8 @@ final class PersistenceController {
         preferences.id = UUID()
         preferences.createdAt = Date()
         preferences.autoLogFillUpLocations = true
+        preferences.setValue(FuelVolumeUnit.gallons.rawValue, forKey: "fuelVolumeUnit")
+        preferences.setValue(DistanceUnit.miles.rawValue, forKey: "distanceUnit")
 
         do {
             try viewContext.save()

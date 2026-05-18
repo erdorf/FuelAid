@@ -4,6 +4,8 @@
 <dict>
 	<key>CKSharingSupported</key>
 	<true/>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>FuelAid uses your location to identify the business name for fill up records when auto logging is enabled.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>remote-notification</string>

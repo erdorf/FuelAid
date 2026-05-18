@@ -14,7 +14,8 @@ import StoreKit
 final class SubscriptionStore {
     static let monthlyProductID = "com.dorfnet.FuelAid.pro.monthly"
     static let yearlyProductID = "com.dorfnet.FuelAid.pro.yearly"
-    static let productIDs = [monthlyProductID, yearlyProductID]
+    static let oneTimeUnlockProductID = "com.dorfnet.FuelAid.pro.onetime"
+    static let productIDs = [monthlyProductID, yearlyProductID, oneTimeUnlockProductID]
 
     private(set) var hasProAccess = false
     private(set) var products: [Product] = []
@@ -31,6 +32,32 @@ final class SubscriptionStore {
     func canAddVehicle(currentCount: Int) -> Bool {
         guard let vehicleLimit else { return true }
         return currentCount < vehicleLimit
+    }
+
+    func product(for option: FuelAidPurchaseOption) -> Product? {
+        products.first { $0.id == option.productID }
+    }
+
+    func purchase(_ option: FuelAidPurchaseOption) async throws {
+        guard let product = product(for: option) else {
+            return
+        }
+
+        let result = try await product.purchase()
+
+        switch result {
+        case .success(let verificationResult):
+            guard case .verified(let transaction) = verificationResult else {
+                return
+            }
+
+            await transaction.finish()
+            await refreshEntitlements()
+        case .pending, .userCancelled:
+            return
+        @unknown default:
+            return
+        }
     }
 
     func start() async {
@@ -78,6 +105,36 @@ final class SubscriptionStore {
                 await transaction.finish()
                 await self?.refreshEntitlements()
             }
+        }
+    }
+}
+
+enum FuelAidPurchaseOption: String, CaseIterable, Identifiable {
+    case monthly
+    case yearly
+    case oneTime
+
+    var id: String { productID }
+
+    var title: String {
+        switch self {
+        case .monthly:
+            return "Monthly Subscription"
+        case .yearly:
+            return "Yearly Subscription"
+        case .oneTime:
+            return "One Time Unlock"
+        }
+    }
+
+    var productID: String {
+        switch self {
+        case .monthly:
+            return SubscriptionStore.monthlyProductID
+        case .yearly:
+            return SubscriptionStore.yearlyProductID
+        case .oneTime:
+            return SubscriptionStore.oneTimeUnlockProductID
         }
     }
 }

@@ -6,6 +6,8 @@
 //
 
 import CoreData
+import CoreLocation
+import MapKit
 import StoreKit
 import SwiftUI
 
@@ -15,6 +17,164 @@ enum TripType: String, CaseIterable, Identifiable {
     case towing = "Towing"
 
     var id: String { rawValue }
+}
+
+enum FuelVolumeUnit: String, CaseIterable, Identifiable {
+    case gallons = "Gallons"
+    case liters = "Liters"
+
+    var id: String { rawValue }
+    var abbreviation: String { self == .gallons ? "gal" : "L" }
+    var singularName: String { self == .gallons ? "Gallon" : "Liter" }
+}
+
+enum DistanceUnit: String, CaseIterable, Identifiable {
+    case miles = "Miles"
+    case kilometers = "Kilometers"
+
+    var id: String { rawValue }
+    var abbreviation: String { self == .miles ? "mi" : "km" }
+    var speedAbbreviation: String { self == .miles ? "mph" : "km/h" }
+}
+
+enum LocationLookupError: LocalizedError {
+    case denied
+    case unavailable
+
+    var errorDescription: String? {
+        switch self {
+        case .denied:
+            return "Location permission is required to auto log fill up locations."
+        case .unavailable:
+            return "Unable to identify the current location."
+        }
+    }
+}
+
+@MainActor
+final class LocationLookupService: NSObject, CLLocationManagerDelegate {
+    private let manager = CLLocationManager()
+    private var continuation: CheckedContinuation<CLLocation, Error>?
+
+    override init() {
+        super.init()
+        manager.delegate = self
+        manager.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
+    }
+
+    func currentPlaceName() async throws -> String {
+        let location = try await currentLocation()
+        guard let request = MKReverseGeocodingRequest(location: location) else {
+            throw LocationLookupError.unavailable
+        }
+
+        let mapItems = try await mapItems(for: request)
+        guard let mapItem = mapItems.first else {
+            throw LocationLookupError.unavailable
+        }
+
+        return mapItem.name
+            ?? "Current Location"
+    }
+
+    private func mapItems(for request: MKReverseGeocodingRequest) async throws -> [MKMapItem] {
+        try await withCheckedThrowingContinuation { continuation in
+            request.getMapItems { mapItems, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                    return
+                }
+
+                continuation.resume(returning: mapItems ?? [])
+            }
+        }
+    }
+
+    private func currentLocation() async throws -> CLLocation {
+        let status = manager.authorizationStatus
+
+        guard status != .denied, status != .restricted else {
+            throw LocationLookupError.denied
+        }
+
+        if status == .notDetermined {
+            manager.requestWhenInUseAuthorization()
+        }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            self.continuation = continuation
+            manager.requestLocation()
+        }
+    }
+
+    nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        Task { @MainActor in
+            guard let location = locations.last else {
+                continuation?.resume(throwing: LocationLookupError.unavailable)
+                continuation = nil
+                return
+            }
+
+            continuation?.resume(returning: location)
+            continuation = nil
+        }
+    }
+
+    nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        Task { @MainActor in
+            continuation?.resume(throwing: error)
+            continuation = nil
+        }
+    }
+}
+
+struct MeasurementPreferences {
+    static let litersPerGallon = 3.785411784
+    static let kilometersPerMile = 1.609344
+
+    var fuelVolumeUnit = FuelVolumeUnit.gallons
+    var distanceUnit = DistanceUnit.miles
+
+    func gallons(fromDisplayedVolume value: Double) -> Double {
+        fuelVolumeUnit == .gallons ? value : value / Self.litersPerGallon
+    }
+
+    func displayedVolume(fromGallons gallons: Double) -> Double {
+        fuelVolumeUnit == .gallons ? gallons : gallons * Self.litersPerGallon
+    }
+
+    func pricePerGallon(fromDisplayedPrice value: Double) -> Double {
+        fuelVolumeUnit == .gallons ? value : value * Self.litersPerGallon
+    }
+
+    func miles(fromDisplayedDistance value: Double) -> Double {
+        distanceUnit == .miles ? value : value / Self.kilometersPerMile
+    }
+
+    func displayedDistance(fromMiles miles: Double) -> Double {
+        distanceUnit == .miles ? miles : miles * Self.kilometersPerMile
+    }
+
+    func displayedEfficiency(miles: Double, gallons: Double) -> Double? {
+        guard miles > 0, gallons > 0 else { return nil }
+        return displayedDistance(fromMiles: miles) / displayedVolume(fromGallons: gallons)
+    }
+
+    var efficiencyAbbreviation: String {
+        "\(distanceUnit.abbreviation)/\(fuelVolumeUnit.abbreviation)"
+    }
+
+    var efficiencyDescription: String {
+        "\(distanceUnit.rawValue) per \(fuelVolumeUnit.singularName)"
+    }
+
+    func formattedVolume(gallons: Double) -> String {
+        "\(displayedVolume(fromGallons: gallons).formatted(.number.precision(.fractionLength(1)))) \(fuelVolumeUnit.abbreviation)"
+    }
+
+    func formattedDistance(miles: Double) -> String {
+        "\(displayedDistance(fromMiles: miles).formatted(.number.precision(.fractionLength(1)))) \(distanceUnit.abbreviation)"
+    }
 }
 
 struct ContentView: View {
@@ -37,20 +197,40 @@ struct ContentView: View {
     @State private var showingFillUpForm = false
     @State private var showingTripForm = false
     @State private var showingUpgrade = false
+    @State private var selectedVehicleID: NSManagedObjectID?
+    @State private var measurementRefreshID = UUID()
 
     private var defaultVehicle: Vehicle? {
-        vehicles.first(where: { $0.isDefault }) ?? vehicles.first
+        activeVehicles.first(where: { $0.isDefault }) ?? activeVehicles.first
+    }
+
+    private var selectedVehicle: Vehicle? {
+        guard let selectedVehicleID,
+              let vehicle = activeVehicles.first(where: { $0.objectID == selectedVehicleID }) else {
+            return defaultVehicle
+        }
+
+        return vehicle
+    }
+
+    private var activeVehicles: [Vehicle] {
+        vehicles.filter { !$0.isArchivedForDisplay }
+    }
+
+    private var measurementPreferences: MeasurementPreferences {
+        preferences.first?.measurementPreferences ?? MeasurementPreferences()
     }
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 16) {
-                    QuickFuelCard(defaultVehicle: defaultVehicle, addAction: { showingFillUpForm = true })
-                    MPGTrendCard(vehicle: defaultVehicle, fillUps: Array(fillUps))
+                    QuickFuelCard(vehicles: activeVehicles, selectedVehicleID: $selectedVehicleID, selectedVehicle: selectedVehicle, addAction: { showingFillUpForm = true })
+                    MPGTrendCard(vehicle: selectedVehicle, fillUps: Array(fillUps), measurements: measurementPreferences)
+                        .id(measurementRefreshID)
                     PlanStatusCard(vehicleCount: vehicles.count)
                     DashboardLinks(showUpgrade: { showingUpgrade = true })
-                    RecentActivityCard(fillUps: Array(fillUps.prefix(3)), trips: Array(trips.prefix(3)))
+                    RecentActivityCard(fillUps: Array(fillUps.prefix(3)), trips: Array(trips.prefix(3)), measurements: measurementPreferences)
                 }
                 .padding()
             }
@@ -59,7 +239,6 @@ struct ContentView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
-                        Button("Add Vehicle", systemImage: "car") { showVehicleEntry() }
                         Button("Log Fill-Up", systemImage: "fuelpump") { showingFillUpForm = true }
                         Button("Start Trip", systemImage: "map") { showingTripForm = true }
                     } label: {
@@ -71,12 +250,12 @@ struct ContentView: View {
                 VehicleForm { saveVehicle($0) }
             }
             .sheet(isPresented: $showingFillUpForm) {
-                FillUpForm(vehicles: Array(vehicles), defaultVehicle: defaultVehicle, autoLogLocation: preferences.first?.autoLogFillUpLocations ?? true) {
+                FillUpForm(vehicles: activeVehicles, defaultVehicle: selectedVehicle, autoLogLocation: preferences.first?.autoLogFillUpLocations ?? true, measurements: measurementPreferences) {
                     saveFillUp($0)
                 }
             }
             .sheet(isPresented: $showingTripForm) {
-                TripForm(vehicles: Array(vehicles), defaultVehicle: defaultVehicle) {
+                TripForm(vehicles: activeVehicles, defaultVehicle: defaultVehicle, measurements: measurementPreferences) {
                     saveTrip($0)
                 }
             }
@@ -84,11 +263,41 @@ struct ContentView: View {
                 UpgradeView()
             }
             .onAppear(perform: ensurePreferencesExist)
+            .onAppear(perform: selectDefaultVehicleIfNeeded)
+            .onChange(of: defaultVehicle?.objectID) { _, _ in
+                selectDefaultVehicleIfNeeded()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .NSManagedObjectContextObjectsDidChange, object: viewContext)) { notification in
+                refreshMeasurementsIfNeeded(for: notification)
+            }
+        }
+    }
+
+    private func selectDefaultVehicleIfNeeded() {
+        if let selectedVehicleID,
+           activeVehicles.contains(where: { $0.objectID == selectedVehicleID }) {
+            return
+        }
+
+        selectedVehicleID = defaultVehicle?.objectID
+    }
+
+    private func refreshMeasurementsIfNeeded(for notification: Notification) {
+        let changedObjects = [
+            NSUpdatedObjectsKey,
+            NSInsertedObjectsKey,
+            NSRefreshedObjectsKey
+        ]
+            .compactMap { notification.userInfo?[$0] as? Set<NSManagedObject> }
+            .flatMap { $0 }
+
+        if changedObjects.contains(where: { $0 is AppPreference }) {
+            measurementRefreshID = UUID()
         }
     }
 
     private func showVehicleEntry() {
-        if subscriptionStore.canAddVehicle(currentCount: vehicles.count) {
+        if subscriptionStore.canAddVehicle(currentCount: activeVehicles.count) {
             showingVehicleForm = true
         } else {
             showingUpgrade = true
@@ -96,7 +305,7 @@ struct ContentView: View {
     }
 
     private func saveVehicle(_ draft: VehicleDraft) {
-        guard subscriptionStore.canAddVehicle(currentCount: vehicles.count) else {
+        guard subscriptionStore.canAddVehicle(currentCount: activeVehicles.count) else {
             showingUpgrade = true
             return
         }
@@ -105,14 +314,10 @@ struct ContentView: View {
         assignToPrivateStore(vehicle)
         vehicle.id = UUID()
         vehicle.createdAt = Date()
-        vehicle.name = draft.name
-        vehicle.make = draft.make
-        vehicle.model = draft.model
-        vehicle.year = Int64(draft.year) ?? 0
-        vehicle.vin = draft.vin
-        vehicle.licensePlate = draft.licensePlate
-        vehicle.recommendedTirePressure = Double(draft.recommendedTirePressure) ?? 0
-        vehicle.isDefault = vehicles.isEmpty || draft.isDefault
+        apply(draft, to: vehicle)
+        vehicle.setValue(false, forKey: "isArchived")
+        vehicle.setValue(nil, forKey: "archivedAt")
+        vehicle.isDefault = activeVehicles.isEmpty || draft.isDefault
 
         if vehicle.isDefault {
             vehicles.forEach { $0.isDefault = false }
@@ -127,9 +332,9 @@ struct ContentView: View {
         fillUp.id = UUID()
         fillUp.date = draft.date
         fillUp.vehicle = draft.vehicle
-        fillUp.odometer = Double(draft.odometer) ?? 0
-        fillUp.gallons = Double(draft.gallons) ?? 0
-        fillUp.pricePerGallon = Double(draft.pricePerGallon) ?? 0
+        fillUp.odometer = measurementPreferences.miles(fromDisplayedDistance: Double(draft.odometer) ?? 0)
+        fillUp.gallons = measurementPreferences.gallons(fromDisplayedVolume: Double(draft.gallons) ?? 0)
+        fillUp.pricePerGallon = measurementPreferences.pricePerGallon(fromDisplayedPrice: Double(draft.pricePerGallon) ?? 0)
         fillUp.totalCost = fillUp.gallons * fillUp.pricePerGallon
         fillUp.location = draft.location
         fillUp.autoLoggedLocation = draft.autoLoggedLocation
@@ -147,8 +352,8 @@ struct ContentView: View {
         trip.startLocation = draft.startLocation
         trip.endLocation = draft.endLocation
         trip.route = draft.route
-        trip.distance = Double(draft.distance) ?? 0
-        trip.averageSpeed = Double(draft.averageSpeed) ?? 0
+        trip.distance = measurementPreferences.miles(fromDisplayedDistance: Double(draft.distance) ?? 0)
+        trip.averageSpeed = measurementPreferences.miles(fromDisplayedDistance: Double(draft.averageSpeed) ?? 0)
         trip.tripType = draft.tripType.rawValue
         saveContext()
     }
@@ -161,6 +366,8 @@ struct ContentView: View {
         preference.id = UUID()
         preference.createdAt = Date()
         preference.autoLogFillUpLocations = true
+        preference.setValue(FuelVolumeUnit.gallons.rawValue, forKey: "fuelVolumeUnit")
+        preference.setValue(DistanceUnit.miles.rawValue, forKey: "distanceUnit")
         saveContext()
     }
 
@@ -293,15 +500,42 @@ private struct DashboardLink: View {
 }
 
 private struct QuickFuelCard: View {
-    let defaultVehicle: Vehicle?
+    let vehicles: [Vehicle]
+    @Binding var selectedVehicleID: NSManagedObjectID?
+    let selectedVehicle: Vehicle?
     let addAction: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(defaultVehicle?.displayName ?? "No Default Vehicle")
-                        .font(.title3.weight(.semibold))
+                    if vehicles.isEmpty {
+                        Text("No Vehicle Selected")
+                            .font(.title3.weight(.semibold))
+                    } else {
+                        Menu {
+                            ForEach(vehicles, id: \.objectID) { vehicle in
+                                Button {
+                                    selectedVehicleID = vehicle.objectID
+                                } label: {
+                                    if selectedVehicleID == vehicle.objectID {
+                                        Label(vehicle.displayName, systemImage: "checkmark")
+                                    } else {
+                                        Text(vehicle.displayName)
+                                    }
+                                }
+                            }
+                        } label: {
+                            HStack(spacing: 6) {
+                                Text(selectedVehicle?.displayName ?? "Select Vehicle")
+                                    .font(.title3.weight(.semibold))
+                                Image(systemName: "chevron.down.circle.fill")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
                     Text("Quick fuel entry")
                         .foregroundStyle(.secondary)
                 }
@@ -312,8 +546,9 @@ private struct QuickFuelCard: View {
                     Label("Log", systemImage: "fuelpump.fill")
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(defaultVehicle == nil)
+                .disabled(selectedVehicle == nil)
             }
+
         }
         .padding()
         .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 8))
@@ -323,6 +558,7 @@ private struct QuickFuelCard: View {
 private struct MPGTrendCard: View {
     let vehicle: Vehicle?
     let fillUps: [FillUp]
+    let measurements: MeasurementPreferences
 
     private var points: [Double] {
         guard let vehicle else { return [] }
@@ -337,23 +573,39 @@ private struct MPGTrendCard: View {
             let current = vehicleFillUps[index]
             let previous = vehicleFillUps[index - 1]
             let miles = current.odometer - previous.odometer
-            guard miles > 0, current.gallons > 0 else { return nil }
-            return miles / current.gallons
+            return measurements.displayedEfficiency(miles: miles, gallons: current.gallons)
         }
+    }
+
+    private var title: String {
+        if measurements.distanceUnit == .miles && measurements.fuelVolumeUnit == .gallons {
+            return "MPG Trend"
+        }
+
+        return "Fuel Economy Trend (\(measurements.efficiencyDescription))"
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("MPG Trend")
+                Text(title)
                     .font(.headline)
                 Spacer()
-                Text(points.last.map { "\($0, specifier: "%.1f") MPG" } ?? "No data")
+                Text(points.last.map { "\($0, specifier: "%.1f") \(measurements.efficiencyAbbreviation)" } ?? "No data")
                     .foregroundStyle(.secondary)
             }
 
-            MPGLineGraph(points: points)
+            if points.count > 1 {
+                MPGLineGraph(points: points, unit: measurements.efficiencyAbbreviation)
+                    .frame(height: 140)
+            } else {
+                ContentUnavailableView(
+                    "Not Enough Fuel History",
+                    systemImage: "chart.line.uptrend.xyaxis",
+                    description: Text("Log at least two fill ups for this vehicle.")
+                )
                 .frame(height: 140)
+            }
         }
         .padding()
         .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 8))
@@ -362,30 +614,73 @@ private struct MPGTrendCard: View {
 
 private struct MPGLineGraph: View {
     let points: [Double]
+    let unit: String
 
     var body: some View {
         GeometryReader { proxy in
-            Path { path in
-                guard points.count > 1, let minValue = points.min(), let maxValue = points.max() else { return }
+            ZStack {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color(.tertiarySystemGroupedBackground))
 
-                let width = proxy.size.width
-                let height = proxy.size.height
-                let range = max(maxValue - minValue, 1)
+                Path { path in
+                    let horizontalStep = proxy.size.height / 3
 
-                for index in points.indices {
-                    let x = width * CGFloat(index) / CGFloat(points.count - 1)
-                    let y = height - ((points[index] - minValue) / range * height)
-                    let point = CGPoint(x: x, y: y)
+                    for index in 1...2 {
+                        let y = horizontalStep * CGFloat(index)
+                        path.move(to: CGPoint(x: 0, y: y))
+                        path.addLine(to: CGPoint(x: proxy.size.width, y: y))
+                    }
+                }
+                .stroke(Color(.separator).opacity(0.35), lineWidth: 1)
 
-                    if index == points.startIndex {
-                        path.move(to: point)
-                    } else {
-                        path.addLine(to: point)
+                Path { path in
+                    guard let minValue = points.min(), let maxValue = points.max() else { return }
+
+                    let horizontalInset: CGFloat = 10
+                    let verticalInset: CGFloat = 24
+                    let width = max(proxy.size.width - horizontalInset * 2, 1)
+                    let height = max(proxy.size.height - verticalInset * 2, 1)
+                    let range = max(maxValue - minValue, 1)
+
+                    for index in points.indices {
+                        let x = horizontalInset + width * CGFloat(index) / CGFloat(points.count - 1)
+                        let y = verticalInset + height - ((points[index] - minValue) / range * height)
+                        let point = CGPoint(x: x, y: y)
+
+                        if index == points.startIndex {
+                            path.move(to: point)
+                        } else {
+                            path.addLine(to: point)
+                        }
+                    }
+                }
+                .stroke(.green, style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
+
+                ForEach(Array(points.enumerated()), id: \.offset) { index, value in
+                    if let minValue = points.min(), let maxValue = points.max() {
+                        let horizontalInset: CGFloat = 10
+                        let verticalInset: CGFloat = 24
+                        let width = max(proxy.size.width - horizontalInset * 2, 1)
+                        let height = max(proxy.size.height - verticalInset * 2, 1)
+                        let range = max(maxValue - minValue, 1)
+                        let x = horizontalInset + width * CGFloat(index) / CGFloat(points.count - 1)
+                        let y = verticalInset + height - ((value - minValue) / range * height)
+
+                        Circle()
+                            .fill(.green)
+                            .frame(width: 7, height: 7)
+                            .position(x: x, y: y)
+
+                        Text(value.formatted(.number.precision(.fractionLength(1))))
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.primary)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 2)
+                            .background(.thinMaterial, in: Capsule())
+                            .position(x: x, y: max(y - 15, 10))
                     }
                 }
             }
-            .stroke(.green, style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
-            .background(Color(.tertiarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 8))
         }
     }
 }
@@ -393,6 +688,7 @@ private struct MPGLineGraph: View {
 private struct RecentActivityCard: View {
     let fillUps: [FillUp]
     let trips: [Trip]
+    let measurements: MeasurementPreferences
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -404,11 +700,11 @@ private struct RecentActivityCard: View {
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(fillUps, id: \.objectID) { fillUp in
-                    Label("\(fillUp.vehicle?.displayName ?? "Vehicle") fuel: \(fillUp.gallons, specifier: "%.1f") gal", systemImage: "fuelpump")
+                    Label("\(fillUp.vehicle?.displayName ?? "Vehicle") fuel: \(measurements.formattedVolume(gallons: fillUp.gallons))", systemImage: "fuelpump")
                 }
 
                 ForEach(trips, id: \.objectID) { trip in
-                    Label("\(trip.name?.nilIfEmpty ?? "Trip"): \(trip.distance, specifier: "%.1f") mi", systemImage: "map")
+                    Label("\(trip.name?.nilIfEmpty ?? "Trip"): \(measurements.formattedDistance(miles: trip.distance))", systemImage: "map")
                 }
             }
         }
@@ -424,33 +720,43 @@ private struct VehicleListView: View {
     @FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \Vehicle.name, ascending: true)], animation: .default)
     private var vehicles: FetchedResults<Vehicle>
 
+    @State private var showingVehicleForm = false
+    @State private var showingUpgrade = false
+
+    private var activeVehicles: [Vehicle] {
+        vehicles.filter { !$0.isArchivedForDisplay }
+    }
+
+    private var archivedVehicles: [Vehicle] {
+        vehicles
+            .filter(\.isArchivedForDisplay)
+            .sorted { ($0.archivedAtForDisplay ?? .distantPast) > ($1.archivedAtForDisplay ?? .distantPast) }
+    }
+
     var body: some View {
         List {
-            ForEach(vehicles, id: \.objectID) { vehicle in
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text(vehicle.displayName)
-                            .font(.headline)
-                        if vehicle.isDefault {
-                            Image(systemName: "star.fill")
-                                .foregroundStyle(.yellow)
+            Section("Vehicles") {
+                if activeVehicles.isEmpty {
+                    Text("No active vehicles.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(activeVehicles, id: \.objectID) { vehicle in
+                        NavigationLink {
+                            VehicleEditorView(vehicle: vehicle, allVehicles: Array(vehicles))
+                        } label: {
+                            VehicleRow(vehicle: vehicle)
+                        }
+                        .swipeActions {
+                            Button {
+                                vehicles.forEach { $0.isDefault = false }
+                                vehicle.isDefault = true
+                                try? viewContext.save()
+                            } label: {
+                                Label("Default", systemImage: "star")
+                            }
+                            .tint(.yellow)
                         }
                     }
-                    Text("\(vehicle.year == 0 ? "" : String(vehicle.year)) \(vehicle.make ?? "") \(vehicle.model ?? "")")
-                        .foregroundStyle(.secondary)
-                    Text("Plate: \(vehicle.licensePlate?.nilIfEmpty ?? "Not set")")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .swipeActions {
-                    Button {
-                        vehicles.forEach { $0.isDefault = false }
-                        vehicle.isDefault = true
-                        try? viewContext.save()
-                    } label: {
-                        Label("Default", systemImage: "star")
-                    }
-                    .tint(.yellow)
                 }
             }
 
@@ -460,14 +766,217 @@ private struct VehicleListView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+
+            if !archivedVehicles.isEmpty {
+                Section("Archived") {
+                    ForEach(archivedVehicles, id: \.objectID) { vehicle in
+                        NavigationLink {
+                            VehicleEditorView(vehicle: vehicle, allVehicles: Array(vehicles))
+                        } label: {
+                            VehicleRow(vehicle: vehicle)
+                        }
+                    }
+                }
+            }
         }
         .navigationTitle("Vehicles")
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button(action: showVehicleEntry) {
+                    Image(systemName: "plus.circle.fill")
+                }
+            }
+        }
+        .sheet(isPresented: $showingVehicleForm) {
+            VehicleForm { saveVehicle($0) }
+        }
+        .sheet(isPresented: $showingUpgrade) {
+            UpgradeView()
+        }
+    }
+
+    private func showVehicleEntry() {
+        if subscriptionStore.canAddVehicle(currentCount: activeVehicles.count) {
+            showingVehicleForm = true
+        } else {
+            showingUpgrade = true
+        }
+    }
+
+    private func saveVehicle(_ draft: VehicleDraft) {
+        guard subscriptionStore.canAddVehicle(currentCount: activeVehicles.count) else {
+            showingUpgrade = true
+            return
+        }
+
+        let vehicle = Vehicle(context: viewContext)
+        vehicle.id = UUID()
+        vehicle.createdAt = Date()
+        apply(draft, to: vehicle)
+        vehicle.setValue(false, forKey: "isArchived")
+        vehicle.setValue(nil, forKey: "archivedAt")
+        vehicle.isDefault = activeVehicles.isEmpty || draft.isDefault
+
+        if vehicle.isDefault {
+            vehicles.forEach { $0.isDefault = false }
+        }
+
+        try? viewContext.save()
+    }
+}
+
+private struct VehicleRow: View {
+    let vehicle: Vehicle
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(vehicle.displayName)
+                    .font(.headline)
+                if vehicle.isDefault {
+                    Image(systemName: "star.fill")
+                        .foregroundStyle(.yellow)
+                }
+            }
+            Text("\(vehicle.year == 0 ? "" : String(vehicle.year)) \(vehicle.make ?? "") \(vehicle.model ?? "")")
+                .foregroundStyle(.secondary)
+            Text("Plate: \(vehicle.licensePlate?.nilIfEmpty ?? "Not set")")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct VehicleEditorView: View {
+    @Environment(\.managedObjectContext) private var viewContext
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var vehicle: Vehicle
+
+    let allVehicles: [Vehicle]
+
+    @State private var draft: VehicleDraft
+    @State private var showingDeleteConfirmation = false
+
+    init(vehicle: Vehicle, allVehicles: [Vehicle]) {
+        self.vehicle = vehicle
+        self.allVehicles = allVehicles
+        _draft = State(initialValue: VehicleDraft(vehicle: vehicle))
+    }
+
+    var body: some View {
+        Form {
+            VehicleFields(draft: $draft)
+
+            Section {
+                if vehicle.isArchivedForDisplay {
+                    Button("Unarchive Vehicle", systemImage: "arrow.up.bin") {
+                        unarchiveVehicle()
+                    }
+                } else {
+                    Button("Archive Vehicle", systemImage: "archivebox") {
+                        archiveVehicle()
+                    }
+                }
+
+                Button("Delete Vehicle", systemImage: "trash", role: .destructive) {
+                    showingDeleteConfirmation = true
+                }
+            }
+        }
+        .navigationTitle("Edit Vehicle")
+        .toolbar {
+            ToolbarItem(placement: .confirmationAction) {
+                Button("Save") {
+                    saveVehicle()
+                }
+                .disabled(draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .alert("Delete Vehicle?", isPresented: $showingDeleteConfirmation) {
+            Button("Cancel", role: .cancel) { }
+            Button("Delete", role: .destructive) {
+                deleteVehicle()
+            }
+        } message: {
+            Text("This will permanently delete this vehicle and its related fuel and trip records.")
+        }
+    }
+
+    private func saveVehicle() {
+        apply(draft, to: vehicle)
+
+        if !vehicle.isArchivedForDisplay {
+            if draft.isDefault {
+                allVehicles.forEach { $0.isDefault = false }
+                vehicle.isDefault = true
+            } else if vehicle.isDefault {
+                vehicle.isDefault = false
+                promoteDefaultVehicle(excluding: vehicle)
+            }
+        }
+
+        try? viewContext.save()
+        dismiss()
+    }
+
+    private func archiveVehicle() {
+        vehicle.setValue(true, forKey: "isArchived")
+        vehicle.setValue(Date(), forKey: "archivedAt")
+
+        if vehicle.isDefault {
+            vehicle.isDefault = false
+            promoteDefaultVehicle(excluding: vehicle)
+        }
+
+        try? viewContext.save()
+        dismiss()
+    }
+
+    private func unarchiveVehicle() {
+        vehicle.setValue(false, forKey: "isArchived")
+        vehicle.setValue(nil, forKey: "archivedAt")
+
+        if !allVehicles.contains(where: { $0 != vehicle && !$0.isArchivedForDisplay && $0.isDefault }) {
+            vehicle.isDefault = true
+        }
+
+        try? viewContext.save()
+        dismiss()
+    }
+
+    private func deleteVehicle() {
+        let shouldPromoteDefault = vehicle.isDefault
+        viewContext.delete(vehicle)
+
+        if shouldPromoteDefault {
+            promoteDefaultVehicle(excluding: vehicle)
+        }
+
+        try? viewContext.save()
+        dismiss()
+    }
+
+    private func promoteDefaultVehicle(excluding vehicleToExclude: Vehicle) {
+        guard let nextDefault = allVehicles.first(where: { vehicle in
+            vehicle != vehicleToExclude && !vehicle.isArchivedForDisplay
+        }) else {
+            return
+        }
+
+        nextDefault.isDefault = true
     }
 }
 
 private struct TripListView: View {
     @FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \Trip.startDate, ascending: false)], animation: .default)
     private var trips: FetchedResults<Trip>
+
+    @FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \AppPreference.createdAt, ascending: true)], animation: .default)
+    private var preferences: FetchedResults<AppPreference>
+
+    private var measurements: MeasurementPreferences {
+        preferences.first?.measurementPreferences ?? MeasurementPreferences()
+    }
 
     var body: some View {
         List(trips, id: \.objectID) { trip in
@@ -476,7 +985,7 @@ private struct TripListView: View {
                     .font(.headline)
                 Text("\(trip.vehicle?.displayName ?? "Vehicle") - \(trip.tripType ?? TripType.standard.rawValue)")
                     .foregroundStyle(.secondary)
-                Text("\(trip.startLocation?.nilIfEmpty ?? "Start") to \(trip.endLocation?.nilIfEmpty ?? "End")")
+                Text("\(trip.startLocation?.nilIfEmpty ?? "Start") to \(trip.endLocation?.nilIfEmpty ?? "End") - \(measurements.formattedDistance(miles: trip.distance))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -494,6 +1003,13 @@ private struct ReportsView: View {
 
     @FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \Trip.startDate, ascending: true)], animation: .default)
     private var trips: FetchedResults<Trip>
+
+    @FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \AppPreference.createdAt, ascending: true)], animation: .default)
+    private var preferences: FetchedResults<AppPreference>
+
+    private var measurements: MeasurementPreferences {
+        preferences.first?.measurementPreferences ?? MeasurementPreferences()
+    }
 
     var body: some View {
         List {
@@ -525,20 +1041,22 @@ private struct ReportsView: View {
             .filter { $0.tripType == tripType.rawValue }
             .reduce(0) { $0 + $1.distance }
 
-        return "\(mileage.formatted(.number.precision(.fractionLength(1)))) mi"
+        return measurements.formattedDistance(miles: mileage)
     }
 }
 
 private struct SettingsView: View {
     @Environment(\.managedObjectContext) private var viewContext
     @Environment(SubscriptionStore.self) private var subscriptionStore
+    @State private var showingUpgrade = false
+
     @FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \AppPreference.createdAt, ascending: true)], animation: .default)
     private var preferences: FetchedResults<AppPreference>
 
     var body: some View {
         Form {
             Section("Fuel Logging") {
-                Toggle("Auto-log fill-up locations", isOn: Binding(
+                Toggle("Auto Log Fill Up Location", isOn: Binding(
                     get: { preferences.first?.autoLogFillUpLocations ?? true },
                     set: { newValue in
                         preferences.first?.autoLogFillUpLocations = newValue
@@ -547,10 +1065,24 @@ private struct SettingsView: View {
                 ))
             }
 
+            Section("Measurements") {
+                Picker("Fuel volume", selection: fuelVolumeUnitBinding) {
+                    ForEach(FuelVolumeUnit.allCases) { unit in
+                        Text(unit.rawValue).tag(unit)
+                    }
+                }
+
+                Picker("Distance", selection: distanceUnitBinding) {
+                    ForEach(DistanceUnit.allCases) { unit in
+                        Text(unit.rawValue).tag(unit)
+                    }
+                }
+            }
+
             Section("Plan") {
                 LabeledContent("Current plan", value: subscriptionStore.planName)
-                NavigationLink("Upgrade options") {
-                    UpgradeView()
+                Button("Upgrade options") {
+                    showingUpgrade = true
                 }
             }
 
@@ -572,6 +1104,29 @@ private struct SettingsView: View {
             }
         }
         .navigationTitle("Settings")
+        .sheet(isPresented: $showingUpgrade) {
+            UpgradeView()
+        }
+    }
+
+    private var fuelVolumeUnitBinding: Binding<FuelVolumeUnit> {
+        Binding(
+            get: { FuelVolumeUnit(rawValue: preferences.first?.value(forKey: "fuelVolumeUnit") as? String ?? "") ?? .gallons },
+            set: { newValue in
+                preferences.first?.setValue(newValue.rawValue, forKey: "fuelVolumeUnit")
+                try? viewContext.save()
+            }
+        )
+    }
+
+    private var distanceUnitBinding: Binding<DistanceUnit> {
+        Binding(
+            get: { DistanceUnit(rawValue: preferences.first?.value(forKey: "distanceUnit") as? String ?? "") ?? .miles },
+            set: { newValue in
+                preferences.first?.setValue(newValue.rawValue, forKey: "distanceUnit")
+                try? viewContext.save()
+            }
+        )
     }
 }
 
@@ -584,18 +1139,7 @@ private struct VehicleForm: View {
     var body: some View {
         NavigationStack {
             Form {
-                TextField("Vehicle name", text: $draft.name)
-                TextField("Make", text: $draft.make)
-                TextField("Model", text: $draft.model)
-                TextField("Year", text: $draft.year)
-                    .keyboardType(.numberPad)
-                TextField("VIN", text: $draft.vin)
-                    .textInputAutocapitalization(.characters)
-                TextField("License plate", text: $draft.licensePlate)
-                    .textInputAutocapitalization(.characters)
-                TextField("Recommended tire pressure", text: $draft.recommendedTirePressure)
-                    .keyboardType(.decimalPad)
-                Toggle("Set as default vehicle", isOn: $draft.isDefault)
+                VehicleFields(draft: $draft)
             }
             .navigationTitle("Add Vehicle")
             .toolbar {
@@ -614,15 +1158,42 @@ private struct VehicleForm: View {
     }
 }
 
+private struct VehicleFields: View {
+    @Binding var draft: VehicleDraft
+
+    var body: some View {
+        Section("Vehicle") {
+            TextField("Vehicle name", text: $draft.name)
+            TextField("Make", text: $draft.make)
+            TextField("Model", text: $draft.model)
+            TextField("Year", text: $draft.year)
+                .keyboardType(.numberPad)
+            TextField("VIN", text: $draft.vin)
+                .textInputAutocapitalization(.characters)
+            TextField("License plate", text: $draft.licensePlate)
+                .textInputAutocapitalization(.characters)
+            TextField("Recommended tire pressure", text: $draft.recommendedTirePressure)
+                .keyboardType(.decimalPad)
+            Toggle("Set as default vehicle", isOn: $draft.isDefault)
+        }
+    }
+}
+
 private struct FillUpForm: View {
     @Environment(\.dismiss) private var dismiss
     @State private var draft: FillUpDraft
+    @State private var isLookingUpLocation = false
+    @State private var locationError: String?
+
+    private let locationLookupService = LocationLookupService()
 
     let vehicles: [Vehicle]
+    let measurements: MeasurementPreferences
     let onSave: (FillUpDraft) -> Void
 
-    init(vehicles: [Vehicle], defaultVehicle: Vehicle?, autoLogLocation: Bool, onSave: @escaping (FillUpDraft) -> Void) {
+    init(vehicles: [Vehicle], defaultVehicle: Vehicle?, autoLogLocation: Bool, measurements: MeasurementPreferences, onSave: @escaping (FillUpDraft) -> Void) {
         self.vehicles = vehicles
+        self.measurements = measurements
         self.onSave = onSave
         _draft = State(initialValue: FillUpDraft(vehicle: defaultVehicle, autoLoggedLocation: autoLogLocation))
     }
@@ -636,14 +1207,38 @@ private struct FillUpForm: View {
                     }
                 }
                 DatePicker("Date and time", selection: $draft.date)
-                TextField("Odometer", text: $draft.odometer)
+                TextField("Odometer (\(measurements.distanceUnit.abbreviation))", text: $draft.odometer)
                     .keyboardType(.decimalPad)
-                TextField("Gallons", text: $draft.gallons)
+                TextField("\(measurements.fuelVolumeUnit.rawValue)", text: $draft.gallons)
                     .keyboardType(.decimalPad)
-                TextField("Price per gallon", text: $draft.pricePerGallon)
+                TextField("Price per \(measurements.fuelVolumeUnit.abbreviation)", text: $draft.pricePerGallon)
                     .keyboardType(.decimalPad)
                 TextField("Location", text: $draft.location)
-                Toggle("Auto-logged location", isOn: $draft.autoLoggedLocation)
+                Toggle("Auto Logged Location", isOn: Binding(
+                    get: { draft.autoLoggedLocation },
+                    set: { newValue in
+                        draft.autoLoggedLocation = newValue
+
+                        if newValue {
+                            Task {
+                                await lookupCurrentLocation()
+                            }
+                        }
+                    }
+                ))
+
+                if isLookingUpLocation {
+                    HStack {
+                        ProgressView()
+                        Text("Identifying current location")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if let locationError {
+                    Text(locationError)
+                        .foregroundStyle(.red)
+                }
             }
             .navigationTitle("Log Fill-Up")
             .toolbar {
@@ -658,7 +1253,27 @@ private struct FillUpForm: View {
                     .disabled(draft.vehicle == nil)
                 }
             }
+            .task {
+                guard draft.autoLoggedLocation, draft.location.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    return
+                }
+
+                await lookupCurrentLocation()
+            }
         }
+    }
+
+    private func lookupCurrentLocation() async {
+        isLookingUpLocation = true
+        locationError = nil
+
+        do {
+            draft.location = try await locationLookupService.currentPlaceName()
+        } catch {
+            locationError = error.localizedDescription
+        }
+
+        isLookingUpLocation = false
     }
 }
 
@@ -667,10 +1282,12 @@ private struct TripForm: View {
     @State private var draft: TripDraft
 
     let vehicles: [Vehicle]
+    let measurements: MeasurementPreferences
     let onSave: (TripDraft) -> Void
 
-    init(vehicles: [Vehicle], defaultVehicle: Vehicle?, onSave: @escaping (TripDraft) -> Void) {
+    init(vehicles: [Vehicle], defaultVehicle: Vehicle?, measurements: MeasurementPreferences, onSave: @escaping (TripDraft) -> Void) {
         self.vehicles = vehicles
+        self.measurements = measurements
         self.onSave = onSave
         _draft = State(initialValue: TripDraft(vehicle: defaultVehicle))
     }
@@ -694,9 +1311,9 @@ private struct TripForm: View {
                 TextField("Start location", text: $draft.startLocation)
                 TextField("End location", text: $draft.endLocation)
                 TextField("Route", text: $draft.route)
-                TextField("Distance", text: $draft.distance)
+                TextField("Distance (\(measurements.distanceUnit.abbreviation))", text: $draft.distance)
                     .keyboardType(.decimalPad)
-                TextField("Average speed", text: $draft.averageSpeed)
+                TextField("Average speed (\(measurements.distanceUnit.speedAbbreviation))", text: $draft.averageSpeed)
                     .keyboardType(.decimalPad)
             }
             .navigationTitle("Start Trip")
@@ -719,6 +1336,8 @@ private struct TripForm: View {
 private struct UpgradeView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(SubscriptionStore.self) private var subscriptionStore
+    @State private var purchasingProductID: String?
+    @State private var purchaseError: String?
 
     var body: some View {
         NavigationStack {
@@ -739,7 +1358,7 @@ private struct UpgradeView: View {
                     }
                 }
 
-                Section("Subscription") {
+                Section("Upgrade Options") {
                     if subscriptionStore.products.isEmpty {
                         ContentUnavailableView(
                             "Subscriptions Not Configured",
@@ -747,8 +1366,22 @@ private struct UpgradeView: View {
                             description: Text("Add the FuelAid Pro products in App Store Connect or a StoreKit test configuration.")
                         )
                     } else {
-                        StoreView(ids: SubscriptionStore.productIDs)
-                            .storeButton(.visible, for: .restorePurchases)
+                        ForEach(FuelAidPurchaseOption.allCases) { option in
+                            PurchaseOptionRow(
+                                option: option,
+                                product: subscriptionStore.product(for: option),
+                                isPurchasing: purchasingProductID == option.productID
+                            ) {
+                                await purchase(option)
+                            }
+                        }
+                    }
+                }
+
+                if let purchaseError {
+                    Section {
+                        Text(purchaseError)
+                            .foregroundStyle(.red)
                     }
                 }
             }
@@ -757,8 +1390,65 @@ private struct UpgradeView: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done") { dismiss() }
                 }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Restore") {
+                        Task {
+                            try? await AppStore.sync()
+                            await subscriptionStore.refreshEntitlements()
+                        }
+                    }
+                }
             }
         }
+    }
+
+    private func purchase(_ option: FuelAidPurchaseOption) async {
+        purchasingProductID = option.productID
+        purchaseError = nil
+
+        do {
+            try await subscriptionStore.purchase(option)
+        } catch {
+            purchaseError = error.localizedDescription
+        }
+
+        purchasingProductID = nil
+    }
+}
+
+private struct PurchaseOptionRow: View {
+    let option: FuelAidPurchaseOption
+    let product: Product?
+    let isPurchasing: Bool
+    let purchase: () async -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(option.title)
+                    .font(.headline)
+                Text(product?.displayPrice ?? "Unavailable")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            Button {
+                Task {
+                    await purchase()
+                }
+            } label: {
+                if isPurchasing {
+                    ProgressView()
+                } else {
+                    Text("Buy")
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(product == nil || isPurchasing)
+        }
+        .padding(.vertical, 4)
     }
 }
 
@@ -771,6 +1461,19 @@ private struct VehicleDraft {
     var licensePlate = ""
     var recommendedTirePressure = ""
     var isDefault = false
+
+    init() { }
+
+    init(vehicle: Vehicle) {
+        name = vehicle.name ?? ""
+        make = vehicle.make ?? ""
+        model = vehicle.model ?? ""
+        year = vehicle.year == 0 ? "" : String(vehicle.year)
+        vin = vehicle.vin ?? ""
+        licensePlate = vehicle.licensePlate ?? ""
+        recommendedTirePressure = vehicle.recommendedTirePressure == 0 ? "" : String(vehicle.recommendedTirePressure)
+        isDefault = vehicle.isDefault
+    }
 }
 
 private struct FillUpDraft {
@@ -796,9 +1499,36 @@ private struct TripDraft {
     var tripType = TripType.standard
 }
 
+private func apply(_ draft: VehicleDraft, to vehicle: Vehicle) {
+    vehicle.name = draft.name
+    vehicle.make = draft.make
+    vehicle.model = draft.model
+    vehicle.year = Int64(draft.year) ?? 0
+    vehicle.vin = draft.vin
+    vehicle.licensePlate = draft.licensePlate
+    vehicle.recommendedTirePressure = Double(draft.recommendedTirePressure) ?? 0
+}
+
 private extension Vehicle {
     var displayName: String {
         name?.nilIfEmpty ?? [make, model].compactMap { $0?.nilIfEmpty }.joined(separator: " ").nilIfEmpty ?? "Vehicle"
+    }
+
+    var isArchivedForDisplay: Bool {
+        value(forKey: "isArchived") as? Bool ?? false
+    }
+
+    var archivedAtForDisplay: Date? {
+        value(forKey: "archivedAt") as? Date
+    }
+}
+
+private extension AppPreference {
+    var measurementPreferences: MeasurementPreferences {
+        MeasurementPreferences(
+            fuelVolumeUnit: FuelVolumeUnit(rawValue: value(forKey: "fuelVolumeUnit") as? String ?? "") ?? .gallons,
+            distanceUnit: DistanceUnit(rawValue: value(forKey: "distanceUnit") as? String ?? "") ?? .miles
+        )
     }
 }
 

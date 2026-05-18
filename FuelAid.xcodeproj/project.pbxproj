@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		36BA73FF2FBAA230008EBF57 /* FuelAid.storekit in Resources */ = {isa = PBXBuildFile; fileRef = 36BA73FE2FBAA230008EBF57 /* FuelAid.storekit */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		36BA73D72FBA8BE3008EBF57 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -27,6 +31,7 @@
 		36BA73C22FBA8BE2008EBF57 /* FuelAid.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FuelAid.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		36BA73D62FBA8BE3008EBF57 /* FuelAidTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FuelAidTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		36BA73E02FBA8BE3008EBF57 /* FuelAidUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FuelAidUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		36BA73FE2FBAA230008EBF57 /* FuelAid.storekit */ = {isa = PBXFileReference; lastKnownFileType = text; name = FuelAid.storekit; path = FuelAid/FuelAid.storekit; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -88,6 +93,7 @@
 		36BA73B92FBA8BE2008EBF57 = {
 			isa = PBXGroup;
 			children = (
+				36BA73FE2FBAA230008EBF57 /* FuelAid.storekit */,
 				36BA73C42FBA8BE2008EBF57 /* FuelAid */,
 				36BA73D92FBA8BE3008EBF57 /* FuelAidTests */,
 				36BA73E32FBA8BE3008EBF57 /* FuelAidUITests */,
@@ -225,6 +231,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				36BA73FF2FBAA230008EBF57 /* FuelAid.storekit in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
